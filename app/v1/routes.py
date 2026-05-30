@@ -32,6 +32,7 @@ from app.utils import (
     sanitize_filename,
     silence_websocket_exceptions,
 )
+from app.v1.download_manager import download_manager  # ← only new import
 from app.v1.utils import get_extracted_info
 
 router = APIRouter(prefix="/v1")
@@ -303,101 +304,45 @@ def real_download_process(
     )
 
 
+# ── Only this handler changed ────────────────────────────────────────────────
+
+
 @router.websocket("/download/ws", name="Process download (websocket)")
 async def download_websocket_handler(websocket: WebSocket):
     await websocket.accept()
 
     try:
-
-        async def send_progress(response: CustomWebsocketResponse):
-            await websocket.send_json(response.model_dump())
-
-        @silence_websocket_exceptions
-        async def close_websocket():
-            if websocket.state == WebSocketState.CONNECTED:
-                await websocket.close()
-
         payload_dict: dict = await websocket.receive_json()
-        request_payload = models.MediaDownloadProcessPayload(**payload_dict)
+        payload = models.MediaDownloadProcessPayload(**payload_dict)
 
-        def progress_hook(d: dict):
-            if d["status"] == "downloading":
-                try:
-                    progress = (
-                        d.get("downloaded_bytes", 0)
-                        / d.get("total_bytes", 1)
-                        * 100
-                    )
-                except Exception:
-                    return
-
-                speed = d.get("speed") or 0
-                eta = d.get("eta") or 0
-
-                if not speed:
-                    return
-
-                progress_data = {
-                    "progress": f"{progress:.1f}%",
-                    "speed": f"{speed / 1024 / 1024:.1f} MB/s",
-                    "eta": f"{eta // 60}:{eta % 60:02d}",
-                    "ext": d.get("filename", "").split(".")[-1],
-                }
-                asyncio.run(
-                    send_progress(
-                        CustomWebsocketResponse(
-                            status="downloading", detail=progress_data
-                        )
-                    )
-                )
-
-            elif d["status"] == "finished":
-                filename = d.get("filename", "").split("/")[-1]
-                asyncio.run(
-                    send_progress(
-                        CustomWebsocketResponse(
-                            status="finished", detail=dict(filename=filename)
-                        )
-                    )
-                )
-
-        @silence_websocket_exceptions
-        def initiate_download() -> models.MediaDownloadResponse:
-            try:
-                return real_download_process(
-                    request=websocket,
-                    payload=request_payload,
-                    progress_hooks=[progress_hook],
-                )
-            except HTTPException as e:
-                asyncio.run(
-                    send_progress(
-                        CustomWebsocketResponse(
-                            status="error",
-                            detail=dict(status_code=e.status_code, text=e.detail),
-                        )
-                    )
-                )
-
-        download_report = await asyncio.get_running_loop().run_in_executor(
-            None, initiate_download
-        )
-        if isinstance(download_report, models.MediaDownloadResponse):
-            await send_progress(
-                CustomWebsocketResponse(
-                    status="completed", detail=download_report.model_dump()
-                )
+        def run_download(progress_hooks: list[t.Callable]):
+            return real_download_process(
+                request=websocket,
+                payload=payload,
+                progress_hooks=progress_hooks,
             )
-        else:
-            await close_websocket()
+
+        queue = await download_manager.subscribe(
+            url=payload.url,
+            quality=payload.quality,
+            run_download_fn=run_download,
+        )
+
+        while True:
+            message = await queue.get()
+            await websocket.send_json(message)
+            if message["status"] in ("completed", "error"):
+                break
 
     except ValidationError as e:
         error = CustomWebsocketResponse(
             status="error", detail=dict(errors=json.loads(e.json()))
         )
-        await send_progress(error)
-        await close_websocket()
+        await websocket.send_json(error.model_dump())
 
     except Exception as e:
         logger.error(f"Websocket error {e}")
-        await close_websocket()
+
+    finally:
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.close()
