@@ -23,7 +23,7 @@ po_token :
 
 visitorData :
 
-cookiefile :
+cookiefile : /app/cookies.txt
 
 proxy :
 
