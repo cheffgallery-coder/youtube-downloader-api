@@ -24,4 +24,4 @@ COPY . .
 
 RUN uv sync --no-dev
 
-CMD sh -c "uv run fastapi run app --host 0.0.0.0 --port ${PORT:-8000}"
+CMD ["sh", "-c", "if [ -n \"$YOUTUBE_COOKIES_B64\" ]; then echo \"$YOUTUBE_COOKIES_B64\" | base64 -d > /app/cookies.txt && chmod 600 /app/cookies.txt && echo 'YouTube cookies loaded'; else echo 'WARNING: YOUTUBE_COOKIES_B64 is empty'; fi; uv run fastapi run app --host 0.0.0.0 --port ${PORT:-8000}"]
