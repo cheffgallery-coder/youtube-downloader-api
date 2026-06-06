@@ -1,5 +1,7 @@
 import asyncio
 import json
+import time
+import traceback
 import typing as t
 from functools import lru_cache
 from os import path
@@ -18,6 +20,7 @@ from httpx import Proxy
 from innertube import InnerTube
 from pydantic import ValidationError
 from starlette.websockets import WebSocketState
+from yt_dlp import YoutubeDL
 from yt_dlp_bonus import Downloader, YoutubeDLBonus
 from yt_dlp_bonus.constants import audioQualities, videoQualities
 from yt_dlp_bonus.utils import get_size_string
@@ -199,7 +202,154 @@ def process_video_for_download(
     return real_download_process(request, payload)
 
 
-@router_exception_handler
+def _quality_to_height(quality: str) -> int | None:
+    """Convert qualities like '360p' or '720p60' to a max height integer."""
+    if not quality:
+        return None
+    digits = "".join(ch for ch in quality if ch.isdigit())
+    if not digits:
+        return None
+    # 720p60 becomes 72060 with the simple join above, so handle p split first.
+    if "p" in quality:
+        digits = quality.split("p", 1)[0]
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
+def _snapshot_download_dir() -> dict[str, float]:
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot: dict[str, float] = {}
+    for file in DOWNLOAD_DIR.rglob("*"):
+        if file.is_file():
+            try:
+                snapshot[str(file)] = file.stat().st_mtime
+            except OSError:
+                pass
+    return snapshot
+
+
+def _pick_downloaded_file(info: dict, before: dict[str, float]) -> Path:
+    """Find the file created/updated by yt-dlp as robustly as possible."""
+    possible_paths: list[Path] = []
+
+    # yt-dlp often returns final file paths here.
+    for item in info.get("requested_downloads") or []:
+        filepath = item.get("filepath") or item.get("filename")
+        if filepath:
+            possible_paths.append(Path(filepath))
+
+    # Sometimes _filename is present.
+    if info.get("_filename"):
+        possible_paths.append(Path(info["_filename"]))
+
+    for candidate in possible_paths:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    # Fallback: latest changed file in DOWNLOAD_DIR.
+    changed: list[Path] = []
+    for file in DOWNLOAD_DIR.rglob("*"):
+        if not file.is_file():
+            continue
+        if file.name.endswith(".part") or file.name.endswith(".ytdl"):
+            continue
+        try:
+            old_mtime = before.get(str(file))
+            new_mtime = file.stat().st_mtime
+            if old_mtime is None or new_mtime > old_mtime + 0.001:
+                changed.append(file)
+        except OSError:
+            pass
+
+    if changed:
+        return max(changed, key=lambda f: f.stat().st_mtime)
+
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="Download finished but output file could not be found in static directory.",
+    )
+
+
+def _build_direct_ytdlp_opts(
+    payload: models.MediaDownloadProcessPayload,
+    progress_hooks: list[t.Callable],
+    extracted_info,
+) -> dict:
+    """Use direct yt-dlp selectors instead of yt_dlp_bonus quality map.
+
+    This avoids the metadata/download mismatch where metadata shows 360p/720p
+    but the download quality map rejects the same quality.
+    """
+    id_placeholder = " [%(id)s]" if loaded_config.append_id_in_filename else ""
+    prefix = loaded_config.filename_prefix or ""
+    safe_title = sanitize_filename(extracted_info.title or "youtube-video")
+
+    # Keep output inside configured static download directory.
+    outtmpl = f"{prefix}{safe_title}{id_placeholder} %(format_note)s.%(ext)s"
+
+    opts = dict(yt_params)
+    opts.update({
+        "noplaylist": True,
+        "paths": {"home": DOWNLOAD_DIR.as_posix(), "temp": TEMP_DIR.name},
+        "outtmpl": outtmpl,
+        "retries": loaded_config.retries,
+        "continuedl": loaded_config.continuedl,
+        "nopart": loaded_config.nopart,
+        "noprogress": loaded_config.noprogress,
+        "quiet": loaded_config.quiet,
+        "verbose": loaded_config.verbose,
+        "progress_hooks": progress_hooks or [],
+        "http_chunk_size": loaded_config.http_chunk_size,
+        "concurrent_fragment_downloads": loaded_config.concurrent_fragment_downloads,
+    })
+
+    if loaded_config.proxy:
+        opts["proxy"] = loaded_config.proxy
+    if loaded_config.cookiefile:
+        opts["cookiefile"] = loaded_config.cookiefile
+
+    # Audio qualities: ultralow/low/medium OR bestaudio.
+    if payload.quality in audioQualities or payload.quality == "bestaudio":
+        audio_ext = loaded_config.default_audio_format or "m4a"
+        opts["format"] = f"bestaudio[ext={audio_ext}]/bestaudio/best"
+        opts["outtmpl"] = f"{prefix}{safe_title}{id_placeholder} audio.%(ext)s"
+        if payload.bitrate:
+            # Convert to mp3 only when bitrate is requested by caller.
+            opts["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": str(payload.bitrate).replace("k", ""),
+            }]
+        return opts
+
+    # Video qualities: 360p, 720p, 1080p, etc.
+    if payload.quality in videoQualities:
+        height = _quality_to_height(payload.quality)
+        if height:
+            opts["format"] = (
+                f"bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={height}]+bestaudio/"
+                f"best[ext=mp4][height<={height}]/"
+                f"best[height<={height}]/best"
+            )
+        else:
+            opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        opts["merge_output_format"] = "mp4"
+        return opts
+
+    # best / bestvideo fallback.
+    if payload.quality in {"best", "bestvideo"}:
+        opts["format"] = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        opts["merge_output_format"] = "mp4"
+        return opts
+
+    opts["format"] = payload.quality or "best"
+    opts["merge_output_format"] = "mp4"
+    return opts
+
+
 def real_download_process(
     request: Request | WebSocket,
     payload: models.MediaDownloadProcessPayload,
@@ -207,90 +357,46 @@ def real_download_process(
     **kwargs,
 ) -> models.MediaDownloadResponse:
     extracted_info = get_extracted_info(yt=yt, url=payload.url)
-    video_formats = yt.get_video_qualities_with_extension(
-        extracted_info,
-        ext=loaded_config.default_extension,
-        audio_ext=loaded_config.default_audio_format,
-    )
-    target_format = video_formats.get(payload.quality)
-    id_placeholder = ", %(id)s" if loaded_config.append_id_in_filename else ""
-
-    ytdl_opts = {
-        "outtmpl": (
-            f"{loaded_config.filename_prefix or ''}"
-            f"{sanitize_filename(extracted_info.title)} "
-            f"(%(format_note)s{id_placeholder}).%(ext)s"
-        )
-    }
 
     if loaded_config.embed_subtitles and payload.x_lang is not None:
-        ytdl_opts.update({
-            "postprocessors": [
-                {"already_have_subtitle": False, "key": "FFmpegEmbedSubtitle"}
-            ],
-            "writeautomaticsub": True,
-            "writesubtitles": True,
-            "subtitleslangs": [payload.x_lang],
-        })
+        # Leave subtitle embedding off during provider testing unless needed.
+        logger.warning("Subtitle embedding was requested but direct test downloader ignores subtitles for stability.")
 
-    kwargs["ytdl_params"] = ytdl_opts
+    before = _snapshot_download_dir()
+    opts = _build_direct_ytdlp_opts(payload, progress_hooks, extracted_info)
 
-    if payload.quality in audioQualities:
-        assert target_format, (
-            f"The video does not support the audio quality '{payload.quality}'. "
-            "Try other audio qualities like "
-            f"{
-                ', '.join([
-                    quality
-                    for quality in audioQualities
-                    if quality != payload.quality
-                ])
-            }."
+    try:
+        logger.info(
+            "direct_ytdlp_download_start video_id=%s quality=%s format=%s",
+            extracted_info.id,
+            payload.quality,
+            opts.get("format"),
         )
-        processed_info_dict = downloader.ydl_run_audio(
-            extracted_info,
-            audio_format=target_format.format_id,
-            bitrate=payload.bitrate,
-            progress_hooks=progress_hooks,
-            **kwargs,
+        started = time.time()
+        with YoutubeDL(opts) as ydl:
+            processed_info_dict = ydl.extract_info(payload.url, download=True)
+        filepath = _pick_downloaded_file(processed_info_dict, before)
+        logger.info(
+            "direct_ytdlp_download_done video_id=%s quality=%s file=%s elapsed=%.2fs",
+            extracted_info.id,
+            payload.quality,
+            filepath.name,
+            time.time() - started,
         )
-    elif payload.quality in videoQualities:
-        assert target_format, (
-            f"The video does not support the video quality '{payload.quality}'. "
-            f"Try other video qualities like {
-                ', '.join([
-                    quality
-                    for quality in videoQualities
-                    if quality != payload.quality
-                ])
-            }."
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "direct_ytdlp_download_failed video_id=%s quality=%s error=%s\n%s",
+            getattr(extracted_info, "id", None),
+            payload.quality,
+            str(exc),
+            traceback.format_exc(),
         )
-        processed_info_dict = downloader.ydl_run_video(
-            extracted_info,
-            video_format=target_format.format_id,
-            output_ext="mp4",
-            progress_hooks=progress_hooks,
-            **kwargs,
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"yt-dlp download failed: {str(exc)[:500]}",
         )
-        # TODO: Consider audio_format as well
-    else:
-        # bestaudio | bestvideo | best
-        if payload.bitrate:
-            # audio
-            processed_info_dict = downloader.ydl_run_audio(
-                extracted_info,
-                payload.bitrate,
-                audio_format=payload.quality,
-            )
-        else:
-            processed_info_dict = downloader.ydl_run(
-                extracted_info,
-                video_format=None,
-                audio_format=None,
-                default_format=payload.quality,
-            )
-
-    filepath = Path(processed_info_dict["requested_downloads"][0]["filepath"])
 
     return models.MediaDownloadResponse(
         is_success=True,
