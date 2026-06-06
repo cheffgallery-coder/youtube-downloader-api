@@ -210,11 +210,7 @@ def real_download_process(
     video_formats = yt.get_video_qualities_with_extension(
         extracted_info,
         ext=loaded_config.default_extension,
-        audio_ext=(
-            loaded_config.default_audio_format
-            if payload.quality in audioQualities
-            else "webm"
-        ),
+        audio_ext=loaded_config.default_audio_format,
     )
     target_format = video_formats.get(payload.quality)
     id_placeholder = ", %(id)s" if loaded_config.append_id_in_filename else ""
